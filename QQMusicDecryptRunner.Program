@@ -12,16 +12,14 @@ using Microsoft.Win32;
 
 namespace QQMusicDecryptRunner
 {
+    /// <summary>
+    /// QQ 闊充箰瑙ｅ瘑 Runner 鍏ュ彛锛岃礋璐ｅ畾浣?鍚姩 QQ 闊充箰銆佹敞鍏?Hook 骞剁瓑寰呰В瀵嗙粨鏋溿€?    /// </summary>
     internal static class Program
     {
         private const int PipeTimeoutMilliseconds = 30000;
         private const int LaunchTimeoutMilliseconds = 30000;
         private const int CloseTimeoutMilliseconds = 5000;
         private const int HideWindowStabilizeMilliseconds = 5000;
-        private const int DecryptWarmupTimeoutMilliseconds = 15000;
-        private const int DecryptWarmupPollMilliseconds = 200;
-        private const int DecryptWarmupPostReadyDelayMilliseconds = 1000;
-        private const string DecryptModuleName = "QQMusicCommon.dll";
         private const int SwHide = 0;
         private const int EventObjectCreate = 0x8000;
         private const int EventObjectShow = 0x8002;
@@ -36,6 +34,12 @@ namespace QQMusicDecryptRunner
         private const int WsExToolwindow = 0x00000080;
         private const int WsExAppwindow = 0x00040000;
         private const uint PmRemove = 0x0001;
+
+        private const uint TokenQuery = 0x0008;
+        private const uint ProcessQueryLimitedInformation = 0x1000;
+        private const int TokenElevationInfo = 20;
+        private const int TokenIntegrityLevelInfo = 25;
+        private const int SecurityMandatoryHighRid = 0x3000;
 
         private static readonly (RegistryKey Root, string SubKey, string ValueName)[] RegistryPaths =
         {
@@ -52,10 +56,13 @@ namespace QQMusicDecryptRunner
             (Registry.LocalMachine, @"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\QQMusic", "InstallLocation"),
         };
 
+        private const int MaxInjectionAttempts = 2;
+        private const int ClrResetWaitMilliseconds = 5000;
+        private const string ClrCacheErrorSignature = "Code: 15";
+
         private static int Main(string[] args)
         {
             Console.OutputEncoding = Encoding.UTF8;
-
             QqMusicProcessContext? processContext = null;
 
             try
@@ -75,20 +82,10 @@ namespace QQMusicDecryptRunner
                     return 1;
                 }
 
-                processContext = FindOrLaunchQqMusicProcess();
-                if (processContext == null)
-                {
-                    Console.Error.WriteLine("ERROR|QQ Music was not found and could not be launched automatically.");
-                    return 2;
-                }
+                bool runnerElevated = IsCurrentProcessElevated();
+                Console.WriteLine($"LOG|runner_elevated={runnerElevated}; runner_pid={Process.GetCurrentProcess().Id}; runner_session={Process.GetCurrentProcess().SessionId}");
 
-                if (processContext.Process.Id == Process.GetCurrentProcess().Id)
-                {
-                    Console.Error.WriteLine("ERROR|Target process was incorrectly resolved to the decrypt runner itself.");
-                    return 2;
-                }
-
-                string hookPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "QQMusicDecryptHook.dll");
+                string hookPath = FindHookPath();
                 if (!File.Exists(hookPath))
                 {
                     Console.Error.WriteLine($"ERROR|QQMusicDecryptHook.dll was not found: {hookPath}");
@@ -97,75 +94,58 @@ namespace QQMusicDecryptRunner
 
                 Directory.CreateDirectory(outputDirectory);
 
-                string pipeName = "QQMusicDecrypt_" + Guid.NewGuid().ToString("N");
-
-                using (var pipeServer = new NamedPipeServerStream(
-                    pipeName,
-                    PipeDirection.In,
-                    1,
-                    PipeTransmissionMode.Byte,
-                    PipeOptions.Asynchronous))
+                for (int attempt = 1; attempt <= MaxInjectionAttempts; attempt++)
                 {
-                    if (processContext.LaunchedByTool)
+                    processContext = FindOrLaunchQqMusicProcess();
+                    if (processContext == null)
                     {
-                        Console.WriteLine("LOG|Waiting for QQ Music decrypt environment to finish initializing...");
-                        WaitForDecryptEnvironmentReady(processContext.Process);
+                        Console.Error.WriteLine("ERROR|QQ Music was not found and could not be launched automatically."
+                            + $" runner_elevated={runnerElevated}");
+                        return 2;
                     }
 
-                    Console.WriteLine($"LOG|Injecting into QQ Music process (PID={processContext.Process.Id})...");
-
-                    RemoteHooking.Inject(
-                        processContext.Process.Id,
-                        InjectionOptions.DoNotRequireStrongName,
-                        hookPath,
-                        hookPath,
-                        pipeName,
-                        inputPath,
-                        outputDirectory);
-
-                    Task waitConnectionTask = pipeServer.WaitForConnectionAsync();
-                    if (!waitConnectionTask.Wait(PipeTimeoutMilliseconds))
+                    if (processContext.Process.Id == Process.GetCurrentProcess().Id)
                     {
-                        Console.Error.WriteLine("ERROR|Timed out while waiting for QQ Music to respond.");
+                        Console.Error.WriteLine("ERROR|Target process was incorrectly resolved to the decrypt runner itself.");
+                        return 2;
+                    }
+
+                    int? targetIntegrity = GetProcessIntegrityLevel(processContext.Process.Id);
+                    int targetSessionId = -1;
+                    try { targetSessionId = processContext.Process.SessionId; } catch { }
+                    Console.WriteLine($"LOG|target_pid={processContext.Process.Id}; target_session={targetSessionId}"
+                        + $"; target_integrity={targetIntegrity?.ToString() ?? "unknown"}"
+                        + $"; reuse_existing={!processContext.LaunchedByTool}"
+                        + $"; attempt={attempt}/{MaxInjectionAttempts}");
+
+                    int result = InjectAndWaitForResult(
+                        processContext, hookPath, inputPath, outputDirectory);
+
+                    if (result != ExitCodeClrCacheConflict)
+                    {
+                        return result;
+                    }
+
+                    if (attempt < MaxInjectionAttempts)
+                    {
+                        Console.WriteLine("LOG|CLR cache conflict detected (Code: 15). "
+                            + "Restarting QQ Music to reset .NET runtime state...");
+                        KillQqMusicForClrReset(processContext.Process);
+                        processContext = null;
+                    }
+                    else
+                    {
+                        Console.Error.WriteLine("ERROR|Injection failed after restart. "
+                            + "Please close QQ Music manually and retry.");
                         return 4;
                     }
-
-                    using (var reader = new StreamReader(pipeServer, Encoding.UTF8))
-                    {
-                        while (true)
-                        {
-                            Task<string?> readTask = reader.ReadLineAsync();
-                            if (!readTask.Wait(PipeTimeoutMilliseconds))
-                            {
-                                Console.Error.WriteLine("ERROR|QQ Music did not return a decrypt result in time.");
-                                return 5;
-                            }
-
-                            string? line = readTask.Result;
-                            if (line == null)
-                            {
-                                Console.Error.WriteLine("ERROR|QQ Music ended the decrypt pipe unexpectedly.");
-                                return 6;
-                            }
-
-                            Console.WriteLine(line);
-
-                            if (line.StartsWith("RESULT|", StringComparison.Ordinal))
-                            {
-                                return 0;
-                            }
-
-                            if (line.StartsWith("ERROR|", StringComparison.Ordinal))
-                            {
-                                return 7;
-                            }
-                        }
-                    }
                 }
+
+                return 4;
             }
             catch (Exception ex)
             {
-                Console.Error.WriteLine($"ERROR|{ex.Message}");
+                Console.Error.WriteLine("ERROR|" + ex.Message);
                 return 9;
             }
             finally
@@ -177,48 +157,145 @@ namespace QQMusicDecryptRunner
             }
         }
 
-        private static void WaitForDecryptEnvironmentReady(Process process)
+        private const int ExitCodeClrCacheConflict = -15;
+
+        private static string FindHookPath()
         {
-            Stopwatch stopwatch = Stopwatch.StartNew();
-            while (stopwatch.ElapsedMilliseconds < DecryptWarmupTimeoutMilliseconds)
+            string baseDirectory = AppDomain.CurrentDomain.BaseDirectory;
+            string[] candidates =
             {
-                process.Refresh();
+                Path.Combine(baseDirectory, "QQMusicDecryptHook.dll"),
+                Path.Combine(baseDirectory, "MP3AudioConverter.QQMusicDecryptHook.dll")
+            };
 
-                if (process.HasExited)
+            foreach (string candidate in candidates)
+            {
+                if (File.Exists(candidate))
                 {
-                    throw new InvalidOperationException("QQ Music exited before the decrypt environment was ready.");
+                    return candidate;
                 }
-
-                if (IsModuleLoaded(process, DecryptModuleName))
-                {
-                    Thread.Sleep(DecryptWarmupPostReadyDelayMilliseconds);
-                    Console.WriteLine($"LOG|{DecryptModuleName} is ready.");
-                    return;
-                }
-
-                Thread.Sleep(DecryptWarmupPollMilliseconds);
             }
 
-            throw new InvalidOperationException("QQ Music started but QQMusicCommon.dll was not ready in time.");
+            return candidates[0];
         }
 
-        private static bool IsModuleLoaded(Process process, string moduleName)
+        private static int InjectAndWaitForResult(
+            QqMusicProcessContext processContext,
+            string hookPath,
+            string inputPath,
+            string outputDirectory)
+        {
+            string pipeName = "QQMusicDecrypt_" + Guid.NewGuid().ToString("N");
+
+            using (var pipeServer = new NamedPipeServerStream(
+                pipeName,
+                PipeDirection.In,
+                1,
+                PipeTransmissionMode.Byte,
+                PipeOptions.Asynchronous))
+            {
+                try
+                {
+                    RemoteHooking.Inject(
+                        processContext.Process.Id,
+                        InjectionOptions.DoNotRequireStrongName,
+                        hookPath,
+                        hookPath,
+                        pipeName,
+                        inputPath,
+                        outputDirectory,
+                        AppDomain.CurrentDomain.BaseDirectory,
+                        hookPath,
+                        Path.GetExtension(inputPath) ?? string.Empty,
+                        processContext.LaunchedByTool);
+                }
+                catch (Exception injectException)
+                {
+                    if (injectException.Message.Contains(ClrCacheErrorSignature))
+                    {
+                        return ExitCodeClrCacheConflict;
+                    }
+
+                    Console.Error.WriteLine("ERROR|" + injectException.Message);
+                    return 4;
+                }
+
+                Task waitConnectionTask = pipeServer.WaitForConnectionAsync();
+                if (!waitConnectionTask.Wait(PipeTimeoutMilliseconds))
+                {
+                    Console.Error.WriteLine("ERROR|Timed out while waiting for QQ Music decrypt result.");
+                    return 4;
+                }
+
+                using (var reader = new StreamReader(pipeServer, Encoding.UTF8))
+                {
+                    while (true)
+                    {
+                        Task<string?> readTask = reader.ReadLineAsync();
+                        if (!readTask.Wait(PipeTimeoutMilliseconds))
+                        {
+                            Console.Error.WriteLine("ERROR|QQ Music did not return a decrypt result in time.");
+                            return 5;
+                        }
+
+                        string? line = readTask.Result;
+                        if (line == null)
+                        {
+                            Console.Error.WriteLine("ERROR|QQ Music ended the decrypt pipe unexpectedly.");
+                            return 6;
+                        }
+
+                        Console.WriteLine(line);
+
+                        if (line.StartsWith("RESULT|", StringComparison.Ordinal))
+                        {
+                            return 0;
+                        }
+
+                        if (line.StartsWith("ERROR|", StringComparison.Ordinal))
+                        {
+                            return 7;
+                        }
+                    }
+                }
+            }
+        }
+
+        private static void KillQqMusicForClrReset(Process staleProcess)
         {
             try
             {
-                foreach (ProcessModule module in process.Modules)
+                if (!staleProcess.HasExited)
                 {
-                    if (module.ModuleName.Equals(moduleName, StringComparison.OrdinalIgnoreCase))
-                    {
-                        return true;
-                    }
+                    Console.WriteLine($"LOG|Killing QQ Music PID={staleProcess.Id} to reset CLR state...");
+                    staleProcess.Kill();
+                    staleProcess.WaitForExit(ClrResetWaitMilliseconds);
                 }
             }
             catch
             {
             }
 
-            return false;
+            foreach (string processName in new[] { "QQMusic", "QQMusicService", "QQMusicPC" })
+            {
+                foreach (Process remaining in Process.GetProcessesByName(processName))
+                {
+                    try
+                    {
+                        if (!remaining.HasExited)
+                        {
+                            Console.WriteLine($"LOG|Also killing related process {remaining.ProcessName} PID={remaining.Id}");
+                            remaining.Kill();
+                            remaining.WaitForExit(ClrResetWaitMilliseconds);
+                        }
+                    }
+                    catch
+                    {
+                    }
+                }
+            }
+
+            Thread.Sleep(2000);
         }
 
         private static QqMusicProcessContext? FindOrLaunchQqMusicProcess()
@@ -226,20 +303,16 @@ namespace QQMusicDecryptRunner
             Process? running = FindRunningQqMusicProcess();
             if (running != null)
             {
-                Console.WriteLine($"LOG|QQ Music is already running (PID={running.Id}); it will be left running after decrypt.");
                 return new QqMusicProcessContext(running, launchedByTool: false);
             }
 
             string? exePath = FindInstallPath();
             if (string.IsNullOrWhiteSpace(exePath))
             {
-                Console.WriteLine("LOG|QQ Music install path was not found in the registry.");
                 return null;
             }
 
-            Console.WriteLine("LOG|QQ Music is not running; starting it hidden in the background...");
             Process launchedProcess = LaunchAndWaitForReady(exePath!);
-            Console.WriteLine("LOG|This QQ Music instance was started temporarily and will be closed automatically after decrypt.");
             return new QqMusicProcessContext(launchedProcess, launchedByTool: true);
         }
 
@@ -264,7 +337,8 @@ namespace QQMusicDecryptRunner
 
                     try
                     {
-                        if (process.MainWindowHandle != IntPtr.Zero || IsQqMusicExecutable(process))
+                        if ((process.MainWindowHandle != IntPtr.Zero || IsQqMusicExecutable(process))
+                            && IsProcessCompatibleForInjection(process))
                         {
                             return process;
                         }
@@ -290,7 +364,8 @@ namespace QQMusicDecryptRunner
                     }
 
                     if (process.ProcessName.IndexOf("QQMusic", StringComparison.OrdinalIgnoreCase) >= 0 &&
-                        IsQqMusicExecutable(process))
+                        IsQqMusicExecutable(process) &&
+                        IsProcessCompatibleForInjection(process))
                     {
                         return process;
                     }
@@ -391,6 +466,145 @@ namespace QQMusicDecryptRunner
             }
         }
 
+        private static bool IsCurrentProcessElevated()
+        {
+            IntPtr tokenHandle = IntPtr.Zero;
+            try
+            {
+                if (!OpenProcessToken(GetCurrentProcess(), TokenQuery, out tokenHandle))
+                {
+                    return false;
+                }
+
+                int size = 4;
+                IntPtr buffer = Marshal.AllocHGlobal(size);
+                try
+                {
+                    if (!GetTokenInformation(tokenHandle, TokenElevationInfo, buffer, size, out _))
+                    {
+                        return false;
+                    }
+
+                    return Marshal.ReadInt32(buffer) != 0;
+                }
+                finally
+                {
+                    Marshal.FreeHGlobal(buffer);
+                }
+            }
+            catch
+            {
+                return false;
+            }
+            finally
+            {
+                if (tokenHandle != IntPtr.Zero)
+                {
+                    CloseHandle(tokenHandle);
+                }
+            }
+        }
+
+        private static int? GetProcessIntegrityLevel(int processId)
+        {
+            IntPtr hProcess = IntPtr.Zero;
+            IntPtr tokenHandle = IntPtr.Zero;
+            IntPtr buffer = IntPtr.Zero;
+
+            try
+            {
+                hProcess = OpenProcess(ProcessQueryLimitedInformation, false, (uint)processId);
+                if (hProcess == IntPtr.Zero)
+                {
+                    return null;
+                }
+
+                if (!OpenProcessToken(hProcess, TokenQuery, out tokenHandle))
+                {
+                    return null;
+                }
+
+                int requiredSize = 0;
+                GetTokenInformation(tokenHandle, TokenIntegrityLevelInfo, IntPtr.Zero, 0, out requiredSize);
+                if (requiredSize == 0)
+                {
+                    return null;
+                }
+
+                buffer = Marshal.AllocHGlobal(requiredSize);
+                if (!GetTokenInformation(tokenHandle, TokenIntegrityLevelInfo, buffer, requiredSize, out _))
+                {
+                    return null;
+                }
+
+                IntPtr sidPtr = Marshal.ReadIntPtr(buffer);
+                if (sidPtr == IntPtr.Zero)
+                {
+                    return null;
+                }
+
+                IntPtr subAuthorityCountPtr = GetSidSubAuthorityCount(sidPtr);
+                if (subAuthorityCountPtr == IntPtr.Zero)
+                {
+                    return null;
+                }
+
+                byte subAuthorityCount = Marshal.ReadByte(subAuthorityCountPtr);
+                if (subAuthorityCount == 0)
+                {
+                    return null;
+                }
+
+                IntPtr ridPtr = GetSidSubAuthority(sidPtr, (uint)(subAuthorityCount - 1));
+                if (ridPtr == IntPtr.Zero)
+                {
+                    return null;
+                }
+
+                return (int)Marshal.ReadInt32(ridPtr);
+            }
+            catch
+            {
+                return null;
+            }
+            finally
+            {
+                if (buffer != IntPtr.Zero) Marshal.FreeHGlobal(buffer);
+                if (tokenHandle != IntPtr.Zero) CloseHandle(tokenHandle);
+                if (hProcess != IntPtr.Zero) CloseHandle(hProcess);
+            }
+        }
+
+        private static bool IsProcessCompatibleForInjection(Process process)
+        {
+            try
+            {
+                int runnerSessionId = Process.GetCurrentProcess().SessionId;
+                if (process.SessionId != runnerSessionId)
+                {
+                    return false;
+                }
+            }
+            catch
+            {
+                return false;
+            }
+
+            bool runnerElevated = IsCurrentProcessElevated();
+            if (runnerElevated)
+            {
+                return true;
+            }
+
+            int? targetIntegrity = GetProcessIntegrityLevel(process.Id);
+            if (targetIntegrity == null)
+            {
+                return false;
+            }
+
+            return targetIntegrity.Value < SecurityMandatoryHighRid;
+        }
+
         private static Process LaunchAndWaitForReady(string exePath)
         {
             string workingDirectory = Path.GetDirectoryName(exePath) ?? AppDomain.CurrentDomain.BaseDirectory;
@@ -449,21 +663,51 @@ namespace QQMusicDecryptRunner
                         }
                     }
 
+                    bool launchedProcessExited = false;
                     Stopwatch stopwatch = Stopwatch.StartNew();
                     while (stopwatch.ElapsedMilliseconds < LaunchTimeoutMilliseconds)
                     {
                         hiddenLaunch.PumpAndHide();
                         Thread.Sleep(100);
 
-                        Process? running = FindRunningQqMusicProcess();
-                        if (running == null)
+                        if (!launchedProcessExited)
                         {
-                            continue;
+                            try
+                            {
+                                IntPtr hCheck = OpenProcess(0x00100000, false, processInformation.dwProcessId);
+                                if (hCheck == IntPtr.Zero)
+                                {
+                                    launchedProcessExited = true;
+                                }
+                                else
+                                {
+                                    uint exitCode;
+                                    if (GetExitCodeProcess(hCheck, out exitCode) && exitCode != 259)
+                                    {
+                                        launchedProcessExited = true;
+                                    }
+                                    CloseHandle(hCheck);
+                                }
+                            }
+                            catch
+                            {
+                            }
                         }
 
-                        hiddenLaunch.Stabilize(HideWindowStabilizeMilliseconds);
-                        Console.WriteLine($"LOG|QQ Music started hidden (PID={running.Id}).");
-                        return running;
+                        Process? running = FindRunningQqMusicProcess();
+                        if (running != null)
+                        {
+                            hiddenLaunch.Stabilize(HideWindowStabilizeMilliseconds);
+                            Console.WriteLine($"LOG|QQ Music started hidden (PID={running.Id}).");
+                            return running;
+                        }
+
+                        if (launchedProcessExited && stopwatch.ElapsedMilliseconds > 5000)
+                        {
+                            throw new InvalidOperationException(
+                                "QQ Music exited immediately after launch (possible single-instance protection). "
+                                + "If QQ Music is already running as administrator, please close it and retry.");
+                        }
                     }
 
                     throw new TimeoutException("Timed out while waiting for QQ Music to finish startup.");
@@ -584,6 +828,141 @@ namespace QQMusicDecryptRunner
             return handles;
         }
 
+        private static void LogStage(
+            string stage,
+            string inputPath,
+            QqMusicProcessContext? processContext = null,
+            string? hookPath = null,
+            Exception? exception = null,
+            params (string Key, string Value)[] extraFields)
+        {
+            List<(string Key, string Value)> fields = CreateCommonFields(inputPath, processContext, hookPath);
+
+            if (extraFields != null)
+            {
+                fields.AddRange(extraFields);
+            }
+
+            if (exception != null)
+            {
+                fields.Add(("exception_type", exception.GetType().FullName ?? exception.GetType().Name));
+                fields.Add(("exception_message", exception.Message));
+                fields.Add(("stack", exception.ToString()));
+            }
+
+            Console.WriteLine("LOG|" + BuildStructuredMessage(stage, fields));
+        }
+
+        private static void WriteStructuredError(
+            string summary,
+            string stage,
+            string inputPath,
+            QqMusicProcessContext? processContext = null,
+            string? hookPath = null,
+            Exception? exception = null,
+            params (string Key, string Value)[] extraFields)
+        {
+            List<(string Key, string Value)> fields = CreateCommonFields(inputPath, processContext, hookPath);
+            fields.Add(("stage", stage));
+
+            if (extraFields != null)
+            {
+                fields.AddRange(extraFields);
+            }
+
+            if (exception != null)
+            {
+                fields.Add(("exception_type", exception.GetType().FullName ?? exception.GetType().Name));
+                fields.Add(("exception_message", exception.Message));
+                fields.Add(("stack", exception.ToString()));
+            }
+
+            Console.Error.WriteLine("ERROR|" + summary + " Details: " + BuildFieldList(fields));
+        }
+
+        private static List<(string Key, string Value)> CreateCommonFields(
+            string inputPath,
+            QqMusicProcessContext? processContext,
+            string? hookPath)
+        {
+            List<(string Key, string Value)> fields = new List<(string Key, string Value)>
+            {
+                ("runner_base_dir", AppDomain.CurrentDomain.BaseDirectory),
+                ("hook_path", hookPath ?? string.Empty),
+                ("input_extension", Path.GetExtension(inputPath) ?? string.Empty),
+                (
+                    "launched_by_tool",
+                    processContext == null ? "unknown" : processContext.LaunchedByTool ? "true" : "false"
+                ),
+            };
+
+            if (processContext != null)
+            {
+                fields.Add(("qq_pid", processContext.Process.Id.ToString()));
+                fields.Add(("qq_exe_path", SafeGetProcessPath(processContext.Process)));
+            }
+
+            return fields;
+        }
+
+        private static string BuildStructuredMessage(
+            string stage,
+            IEnumerable<(string Key, string Value)> fields)
+        {
+            return "stage=" + Sanitize(stage) + "; " + BuildFieldList(fields);
+        }
+
+        private static string BuildFieldList(IEnumerable<(string Key, string Value)> fields)
+        {
+            StringBuilder builder = new StringBuilder();
+            bool hasAny = false;
+
+            foreach ((string Key, string Value) field in fields)
+            {
+                if (string.IsNullOrWhiteSpace(field.Key))
+                {
+                    continue;
+                }
+
+                if (hasAny)
+                {
+                    builder.Append("; ");
+                }
+
+                builder.Append(field.Key);
+                builder.Append('=');
+                builder.Append(Sanitize(field.Value));
+                hasAny = true;
+            }
+
+            return builder.ToString();
+        }
+
+        private static string SafeGetProcessPath(Process process)
+        {
+            try
+            {
+                return process.MainModule?.FileName ?? string.Empty;
+            }
+            catch
+            {
+                return string.Empty;
+            }
+        }
+
+        private static string Sanitize(string? value)
+        {
+            if (string.IsNullOrWhiteSpace(value))
+            {
+                return string.Empty;
+            }
+
+            return value
+                .Replace("\r", "\\r")
+                .Replace("\n", "\\n")
+                .Trim();
+        }
+
         [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
         [return: MarshalAs(UnmanagedType.Bool)]
         private static extern bool CreateProcessW(
@@ -607,6 +986,40 @@ namespace QQMusicDecryptRunner
         [DllImport("kernel32.dll", SetLastError = true)]
         [return: MarshalAs(UnmanagedType.Bool)]
         private static extern bool CloseHandle(IntPtr hObject);
+
+        [DllImport("kernel32.dll")]
+        private static extern IntPtr GetCurrentProcess();
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool GetExitCodeProcess(IntPtr hProcess, out uint lpExitCode);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern IntPtr OpenProcess(
+            uint processAccess,
+            [MarshalAs(UnmanagedType.Bool)] bool bInheritHandle,
+            uint processId);
+
+        [DllImport("advapi32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool OpenProcessToken(
+            IntPtr processHandle,
+            uint desiredAccess,
+            out IntPtr tokenHandle);
+
+        [DllImport("advapi32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool GetTokenInformation(
+            IntPtr tokenHandle,
+            int tokenInformationClass,
+            IntPtr tokenInformation,
+            int tokenInformationLength,
+            out int returnLength);
+
+        [DllImport("advapi32.dll")]
+        private static extern IntPtr GetSidSubAuthority(IntPtr pSid, uint nSubAuthority);
+
+        [DllImport("advapi32.dll")]
+        private static extern IntPtr GetSidSubAuthorityCount(IntPtr pSid);
 
         [DllImport("user32.dll")]
         private static extern bool ShowWindowAsync(IntPtr hWnd, int nCmdShow);
@@ -674,6 +1087,8 @@ namespace QQMusicDecryptRunner
             uint dwmsEventTime);
 
         [StructLayout(LayoutKind.Sequential)]
+        /// <summary>
+        /// Windows 娑堟伅寰幆涓娇鐢ㄧ殑鍘熺敓娑堟伅缁撴瀯銆?        /// </summary>
         private struct MSG
         {
             public IntPtr hwnd;
@@ -686,6 +1101,8 @@ namespace QQMusicDecryptRunner
         }
 
         [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        /// <summary>
+        /// Windows API 鍒涘缓 QQ 闊充箰杩涚▼鏃朵娇鐢ㄧ殑鍚姩閰嶇疆缁撴瀯銆?        /// </summary>
         private struct STARTUPINFO
         {
             public int cb;
@@ -709,6 +1126,8 @@ namespace QQMusicDecryptRunner
         }
 
         [StructLayout(LayoutKind.Sequential)]
+        /// <summary>
+        /// Windows API 鍒涘缓 QQ 闊充箰杩涚▼鍚庤繑鍥炵殑杩涚▼鍜岀嚎绋嬪彞鏌勪俊鎭€?        /// </summary>
         private struct PROCESS_INFORMATION
         {
             public IntPtr hProcess;
@@ -717,6 +1136,8 @@ namespace QQMusicDecryptRunner
             public uint dwThreadId;
         }
 
+        /// <summary>
+        /// 鍦ㄥ伐鍏蜂复鏃跺惎鍔?QQ 闊充箰鏃堕殣钘忓叾绐楀彛骞跺湪浣滅敤鍩熺粨鏉熸椂閲婃斁浜嬩欢閽╁瓙銆?        /// </summary>
         private sealed class HiddenLaunchScope : IDisposable
         {
             private readonly uint _processId;
@@ -807,3 +1228,4 @@ namespace QQMusicDecryptRunner
         }
     }
 }
+
