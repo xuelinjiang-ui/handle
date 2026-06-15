@@ -1,0 +1,462 @@
+using System.Diagnostics;
+using System.IO;
+
+namespace WpfApp1.Services;
+
+public interface IAudioConverterService
+{
+    Task<ConvertResult> ConvertToMp3Async(string inputPath, IProgress<string>? progress = null);
+}
+
+public sealed class AudioConverterService : IAudioConverterService
+{
+    private const string Mp3Extension = ".mp3";
+    private const string FlacExtension = ".flac";
+    private const string OggExtension = ".ogg";
+    private const string MggExtension = ".mgg";
+    private const string MflacExtension = ".mflac";
+    private const string NcmExtension = ".ncm";
+    private const string KggExtension = ".kgg";
+    private const string KgmaExtension = ".kgma";
+    private const string KwmExtension = ".kwm";
+    private const string SupportedExtensionsDescription = ".flac, .ogg, .mgg, .mflac, .ncm, .kgg, .kgma, .kwm";
+    private const string PreparingMessage = "Preparing conversion...";
+    private const string DecodingNcmMessage = "Decoding NCM...";
+    private const string TranscodingToMp3Message = "Transcoding to MP3...";
+    private static readonly TimeSpan[] MggWholeFlowRetryDelays =
+    {
+        TimeSpan.FromMilliseconds(2000),
+        TimeSpan.FromMilliseconds(5000)
+    };
+
+    private static readonly ISet<string> SupportedInputExtensions = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+    {
+        FlacExtension,
+        OggExtension,
+        MggExtension,
+        MflacExtension,
+        NcmExtension,
+        KggExtension,
+        KgmaExtension,
+        KwmExtension
+    };
+
+    private static readonly ISet<string> SupportedNcmOutputExtensions = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+    {
+        Mp3Extension,
+        FlacExtension
+    };
+
+    private readonly IFfmpegConverter _ffmpegConverter;
+    private readonly INcmDecoder _ncmDecoder;
+    private readonly IQqMusicMggDecryptService _mggDecryptService;
+    private readonly IKggDecryptService _kggDecryptService;
+    private readonly IKwmDecryptService _kwmDecryptService;
+    private readonly Func<string> _outputDirectoryProvider;
+    private readonly Func<string> _temporaryDirectoryFactory;
+
+    public AudioConverterService()
+        : this(
+            new FfmpegConverter(),
+            new NcmDecoder(),
+            new QqMusicInjectedMggDecryptService(),
+            new KggDecryptService(),
+            new KwmDecryptService(),
+            () => Environment.GetFolderPath(Environment.SpecialFolder.Desktop),
+            CreateTemporaryDirectory)
+    {
+    }
+
+    public AudioConverterService(
+        IFfmpegConverter ffmpegConverter,
+        INcmDecoder ncmDecoder,
+        IQqMusicMggDecryptService mggDecryptService,
+        IKggDecryptService kggDecryptService,
+        IKwmDecryptService kwmDecryptService,
+        Func<string> outputDirectoryProvider,
+        Func<string> temporaryDirectoryFactory)
+    {
+        _ffmpegConverter = ffmpegConverter ?? throw new ArgumentNullException(nameof(ffmpegConverter));
+        _ncmDecoder = ncmDecoder ?? throw new ArgumentNullException(nameof(ncmDecoder));
+        _mggDecryptService = mggDecryptService ?? throw new ArgumentNullException(nameof(mggDecryptService));
+        _kggDecryptService = kggDecryptService ?? throw new ArgumentNullException(nameof(kggDecryptService));
+        _kwmDecryptService = kwmDecryptService ?? throw new ArgumentNullException(nameof(kwmDecryptService));
+        _outputDirectoryProvider = outputDirectoryProvider ?? throw new ArgumentNullException(nameof(outputDirectoryProvider));
+        _temporaryDirectoryFactory = temporaryDirectoryFactory ?? throw new ArgumentNullException(nameof(temporaryDirectoryFactory));
+    }
+
+    public async Task<ConvertResult> ConvertToMp3Async(string inputPath, IProgress<string>? progress = null)
+    {
+        if (string.IsNullOrWhiteSpace(inputPath))
+        {
+            return ConvertResult.Failure("Input file path cannot be empty.");
+        }
+
+        if (!File.Exists(inputPath))
+        {
+            return ConvertResult.Failure($"Input file does not exist: {inputPath}");
+        }
+
+        progress?.Report(PreparingMessage);
+
+        try
+        {
+            string inputExtension = GetNormalizedExtension(inputPath);
+            if (!SupportedInputExtensions.Contains(inputExtension))
+            {
+                return ConvertResult.Failure($"Only these file types are supported: {SupportedExtensionsDescription}.");
+            }
+
+            string outputPath = BuildOutputPath(inputPath);
+
+            return inputExtension switch
+            {
+                FlacExtension or OggExtension => await ConvertWithFfmpegAsync(inputPath, outputPath, progress),
+                MggExtension or MflacExtension => await ConvertMggToMp3Async(inputPath, outputPath, progress),
+                NcmExtension => await ConvertNcmToMp3Async(inputPath, outputPath, progress),
+                KggExtension or KgmaExtension => await ConvertKggToMp3Async(inputPath, outputPath, progress),
+                KwmExtension => await ConvertKwmToMp3Async(inputPath, outputPath, progress),
+                _ => ConvertResult.Failure($"Only these file types are supported: {SupportedExtensionsDescription}.")
+            };
+        }
+        catch (Exception exception)
+        {
+            return ConvertResult.Failure($"Audio conversion failed: {exception.Message}");
+        }
+    }
+
+    private async Task<ConvertResult> ConvertMggToMp3Async(string inputPath, string outputPath, IProgress<string>? progress)
+    {
+        for (int attempt = 0; attempt <= MggWholeFlowRetryDelays.Length; attempt++)
+        {
+            ConvertResult attemptResult = await ConvertWithTemporaryDirectoryAsync(async temporaryDirectory =>
+            {
+                QqMusicMggDecryptResult decryptResult = await _mggDecryptService.DecryptAsync(
+                    inputPath,
+                    temporaryDirectory,
+                    progress);
+
+                if (!decryptResult.IsSuccess || string.IsNullOrWhiteSpace(decryptResult.OutputPath))
+                {
+                    return ConvertResult.Failure(decryptResult.ErrorMessage ?? "MGG decrypt failed.");
+                }
+
+                return await FinalizeDecodedAudioAsync(
+                    decryptResult.OutputPath!,
+                    outputPath,
+                    "QQ Music",
+                    progress);
+            });
+
+            if (attemptResult.IsSuccess)
+            {
+                return attemptResult;
+            }
+
+            bool canRetry = attempt < MggWholeFlowRetryDelays.Length &&
+                            ShouldRetryWholeMggConversion(attemptResult.ErrorMessage);
+            if (!canRetry)
+            {
+                return attemptResult;
+            }
+
+            progress?.Report(
+                $"QQ Music returned incomplete audio data during startup. Retrying full decrypt ({attempt + 2}/{MggWholeFlowRetryDelays.Length + 1})...");
+            await Task.Delay(MggWholeFlowRetryDelays[attempt]);
+        }
+
+        return ConvertResult.Failure("QQ Music conversion failed.");
+    }
+
+    private async Task<ConvertResult> ConvertKggToMp3Async(string inputPath, string outputPath, IProgress<string>? progress)
+    {
+        return await ConvertWithTemporaryDirectoryAsync(async temporaryDirectory =>
+        {
+            KggDecryptResult decryptResult = await _kggDecryptService.DecryptAsync(
+                inputPath,
+                temporaryDirectory,
+                progress);
+
+            if (!decryptResult.IsSuccess || string.IsNullOrWhiteSpace(decryptResult.OutputPath))
+            {
+                return ConvertResult.Failure(decryptResult.ErrorMessage ?? "KGG decrypt failed.");
+            }
+
+            return await FinalizeDecodedAudioAsync(
+                decryptResult.OutputPath!,
+                outputPath,
+                "KGG",
+                progress);
+        });
+    }
+
+    private async Task<ConvertResult> ConvertKwmToMp3Async(string inputPath, string outputPath, IProgress<string>? progress)
+    {
+        return await ConvertWithTemporaryDirectoryAsync(async temporaryDirectory =>
+        {
+            KwmDecryptResult decryptResult = await _kwmDecryptService.DecryptAsync(
+                inputPath,
+                temporaryDirectory,
+                progress);
+
+            if (!decryptResult.IsSuccess || string.IsNullOrWhiteSpace(decryptResult.OutputPath))
+            {
+                return ConvertResult.Failure(decryptResult.ErrorMessage ?? "KWM decrypt failed.");
+            }
+
+            return await FinalizeDecodedAudioAsync(
+                decryptResult.OutputPath!,
+                outputPath,
+                "KWM",
+                progress);
+        });
+    }
+
+    private async Task<ConvertResult> ConvertNcmToMp3Async(string inputPath, string outputPath, IProgress<string>? progress)
+    {
+        return await ConvertWithTemporaryDirectoryAsync(async temporaryDirectory =>
+        {
+            progress?.Report(DecodingNcmMessage);
+
+            NcmDecodeResult decodeResult = await _ncmDecoder.DecodeAsync(
+                inputPath,
+                temporaryDirectory,
+                Path.GetFileNameWithoutExtension(inputPath));
+
+            if (!decodeResult.IsSuccess || string.IsNullOrWhiteSpace(decodeResult.OutputPath))
+            {
+                return ConvertResult.Failure(decodeResult.ErrorMessage ?? "NCM decode failed.");
+            }
+
+            return await FinalizeDecodedAudioAsync(
+                decodeResult.OutputPath!,
+                outputPath,
+                "NCM",
+                progress,
+                SupportedNcmOutputExtensions);
+        });
+    }
+
+    private Task<ConvertResult> ConvertWithFfmpegAsync(string inputPath, string outputPath, IProgress<string>? progress)
+    {
+        if (!_ffmpegConverter.IsAvailable)
+        {
+            return Task.FromResult(CreateFfmpegNotFoundResult());
+        }
+
+        progress?.Report(TranscodingToMp3Message);
+        return _ffmpegConverter.ConvertToMp3Async(inputPath, outputPath);
+    }
+
+    private async Task<ConvertResult> FinalizeDecodedAudioAsync(
+        string decodedFilePath,
+        string outputPath,
+        string sourceName,
+        IProgress<string>? progress,
+        ISet<string>? allowedDecodedExtensions = null)
+    {
+        decodedFilePath = ResolveDecodedFilePath(decodedFilePath);
+        if (!File.Exists(decodedFilePath))
+        {
+            return ConvertResult.Failure($"{sourceName} decode succeeded, but the output file was not found: {decodedFilePath}");
+        }
+
+        string? decodedExtension = DetectAudioExtension(decodedFilePath);
+        if (decodedExtension is null)
+        {
+            return ConvertResult.Failure(
+                $"{sourceName} decrypt result is invalid audio data. QQ Music may still be initializing.");
+        }
+
+        if (allowedDecodedExtensions is not null && !allowedDecodedExtensions.Contains(decodedExtension))
+        {
+            return ConvertResult.Failure($"{sourceName} decode produced an unsupported format: {decodedExtension}");
+        }
+
+        if (string.Equals(decodedExtension, Mp3Extension, StringComparison.OrdinalIgnoreCase))
+        {
+            return CopyToOutput(decodedFilePath, outputPath);
+        }
+
+        if (!_ffmpegConverter.IsAvailable)
+        {
+            return ConvertResult.Failure(
+                $"{sourceName} decoded to {decodedExtension}, but ffmpeg.exe was not found. Expected under: {_ffmpegConverter.FfmpegDirectory}");
+        }
+
+        progress?.Report(TranscodingToMp3Message);
+        return await _ffmpegConverter.ConvertToMp3Async(decodedFilePath, outputPath);
+    }
+
+    private async Task<ConvertResult> ConvertWithTemporaryDirectoryAsync(Func<string, Task<ConvertResult>> convertAsync)
+    {
+        string temporaryDirectory = _temporaryDirectoryFactory();
+
+        try
+        {
+            return await convertAsync(temporaryDirectory);
+        }
+        finally
+        {
+            TryDeleteDirectory(temporaryDirectory);
+        }
+    }
+
+    private string BuildOutputPath(string inputPath)
+    {
+        string outputDirectory = _outputDirectoryProvider();
+        string outputFileName = $"{Path.GetFileNameWithoutExtension(inputPath)}{Mp3Extension}";
+        return Path.Combine(outputDirectory, outputFileName);
+    }
+
+    private ConvertResult CreateFfmpegNotFoundResult()
+    {
+        return ConvertResult.Failure($"ffmpeg.exe was not found. Expected under: {_ffmpegConverter.FfmpegDirectory}");
+    }
+
+    private static ConvertResult CopyToOutput(string sourceFilePath, string outputPath)
+    {
+        if (!File.Exists(sourceFilePath))
+        {
+            return ConvertResult.Failure($"Decoded output file was not found: {sourceFilePath}");
+        }
+
+        string? outputDirectory = Path.GetDirectoryName(outputPath);
+        if (string.IsNullOrWhiteSpace(outputDirectory))
+        {
+            return ConvertResult.Failure($"Output directory is invalid: {outputPath}");
+        }
+
+        Directory.CreateDirectory(outputDirectory);
+        File.Copy(sourceFilePath, outputPath, overwrite: true);
+        return ConvertResult.Success(outputPath);
+    }
+
+    private static string GetNormalizedExtension(string filePath)
+    {
+        return Path.GetExtension(filePath).ToLowerInvariant();
+    }
+
+    private static string ResolveDecodedFilePath(string decodedFilePath)
+    {
+        if (File.Exists(decodedFilePath))
+        {
+            return decodedFilePath;
+        }
+
+        string? directory = Path.GetDirectoryName(decodedFilePath);
+        if (string.IsNullOrWhiteSpace(directory) || !Directory.Exists(directory))
+        {
+            return decodedFilePath;
+        }
+
+        string baseName = Path.GetFileNameWithoutExtension(decodedFilePath);
+        string[] candidates = Directory.GetFiles(directory, baseName + ".*");
+        foreach (string candidate in candidates)
+        {
+            if (File.Exists(candidate))
+            {
+                return candidate;
+            }
+        }
+
+        return decodedFilePath;
+    }
+
+    private static string CreateTemporaryDirectory()
+    {
+        string path = Path.Combine(Path.GetTempPath(), "WpfApp1", "decoded", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(path);
+        return path;
+    }
+
+    private static bool ShouldRetryWholeMggConversion(string? errorMessage)
+    {
+        if (string.IsNullOrWhiteSpace(errorMessage))
+        {
+            return false;
+        }
+
+        string value = errorMessage!;
+        return value.IndexOf("invalid audio data", StringComparison.OrdinalIgnoreCase) >= 0 ||
+               value.IndexOf("may still be initializing", StringComparison.OrdinalIgnoreCase) >= 0 ||
+               value.IndexOf("FFmpeg did not create an MP3 file", StringComparison.OrdinalIgnoreCase) >= 0 ||
+               value.IndexOf("Invalid data found when processing input", StringComparison.OrdinalIgnoreCase) >= 0 ||
+               value.IndexOf("cannot find sync word", StringComparison.OrdinalIgnoreCase) >= 0 ||
+               value.IndexOf("low score", StringComparison.OrdinalIgnoreCase) >= 0;
+    }
+
+    private static string? DetectAudioExtension(string filePath)
+    {
+        try
+        {
+            using var stream = File.OpenRead(filePath);
+            byte[] header = new byte[4];
+            int bytesRead = stream.Read(header, 0, header.Length);
+            if (bytesRead <= 0)
+            {
+                return null;
+            }
+
+            ReadOnlySpan<byte> data = header.AsSpan(0, bytesRead);
+            if (StartsWith(data, 0x4F, 0x67, 0x67, 0x53))
+            {
+                return OggExtension;
+            }
+
+            if (StartsWith(data, 0x66, 0x4C, 0x61, 0x43))
+            {
+                return FlacExtension;
+            }
+
+            if (StartsWith(data, 0x49, 0x44, 0x33) ||
+                StartsWith(data, 0xFF, 0xFB) ||
+                StartsWith(data, 0xFF, 0xF3) ||
+                StartsWith(data, 0xFF, 0xF2))
+            {
+                return Mp3Extension;
+            }
+        }
+        catch (Exception exception)
+        {
+            Debug.WriteLine($"Failed to inspect decoded audio header for '{filePath}': {exception}");
+        }
+
+        return null;
+    }
+
+    private static bool StartsWith(ReadOnlySpan<byte> data, params byte[] header)
+    {
+        if (data.Length < header.Length)
+        {
+            return false;
+        }
+
+        for (int index = 0; index < header.Length; index++)
+        {
+            if (data[index] != header[index])
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private static void TryDeleteDirectory(string path)
+    {
+        if (string.IsNullOrWhiteSpace(path) || !Directory.Exists(path))
+        {
+            return;
+        }
+
+        try
+        {
+            Directory.Delete(path, recursive: true);
+        }
+        catch (Exception exception)
+        {
+            Debug.WriteLine($"Failed to delete temporary directory '{path}': {exception}");
+        }
+    }
+}
