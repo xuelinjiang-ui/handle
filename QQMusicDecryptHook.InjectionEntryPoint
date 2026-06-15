@@ -1,35 +1,51 @@
 using System;
-using System.Diagnostics;
 using EasyHook;
 
 namespace QQMusicDecryptHook;
 
+/// <summary>
+/// EasyHook 注入 QQ 音乐进程后的入口，调用 QQ 音乐自身解密能力并通过管道返回结果。
+/// </summary>
 public sealed class InjectionEntryPoint : IEntryPoint
 {
     private readonly string _pipeName;
     private readonly string _inputPath;
     private readonly string _outputDirectory;
 
-    public InjectionEntryPoint(RemoteHooking.IContext context, string pipeName, string inputPath, string outputDirectory)
+    public InjectionEntryPoint(
+        RemoteHooking.IContext context,
+        string pipeName,
+        string inputPath,
+        string outputDirectory,
+        string runnerBaseDirectory,
+        string hookPath,
+        string inputExtension,
+        bool launchedByTool)
     {
         _pipeName = pipeName;
         _inputPath = inputPath;
         _outputDirectory = outputDirectory;
     }
 
-    public void Run(RemoteHooking.IContext context, string pipeName, string inputPath, string outputDirectory)
+    public void Run(
+        RemoteHooking.IContext context,
+        string pipeName,
+        string inputPath,
+        string outputDirectory,
+        string runnerBaseDirectory,
+        string hookPath,
+        string inputExtension,
+        bool launchedByTool)
     {
         using var pipe = new PipeClient(_pipeName);
 
         try
         {
-            Process process = Process.GetCurrentProcess();
-            pipe.SendLog($"已注入 {process.ProcessName} (PID={process.Id})");
-
             RemoteHooking.WakeUpProcess();
 
-            pipe.SendLog("正在调用 QQMusicCommon.dll 解密 MGG...");
-            QqMusicDecryptFileResult result = QqMusicCommonDecryptor.DecryptToFile(_inputPath, _outputDirectory);
+            QqMusicDecryptFileResult result = QqMusicCommonDecryptor.DecryptToFile(
+                _inputPath,
+                _outputDirectory);
             pipe.SendResult(result.OutputPath, result.DetectedFormat);
         }
         catch (Exception ex)
