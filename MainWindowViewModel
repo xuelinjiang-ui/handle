@@ -1,0 +1,133 @@
+using System.ComponentModel;
+using System.Runtime.CompilerServices;
+using System.Windows;
+using System.Windows.Input;
+using Microsoft.Win32;
+using WpfApp1.Services;
+
+namespace WpfApp1.ViewModels;
+
+public class MainWindowViewModel : INotifyPropertyChanged
+{
+    private readonly IAudioConverterService _converterService;
+
+    public MainWindowViewModel()
+        : this(new AudioConverterService())
+    {
+    }
+
+    public MainWindowViewModel(IAudioConverterService converterService)
+    {
+        _converterService = converterService ?? throw new ArgumentNullException(nameof(converterService));
+        SelectFileCommand = new RelayCommand(async _ => await OnSelectFileAsync(), _ => !IsBusy);
+    }
+
+    private bool _isBusy;
+    public bool IsBusy
+    {
+        get => _isBusy;
+        private set
+        {
+            if (_isBusy == value)
+            {
+                return;
+            }
+
+            _isBusy = value;
+            OnPropertyChanged();
+            ((RelayCommand)SelectFileCommand).RaiseCanExecuteChanged();
+        }
+    }
+
+    private string _statusText = string.Empty;
+    public string StatusText
+    {
+        get => _statusText;
+        private set
+        {
+            if (_statusText == value)
+            {
+                return;
+            }
+
+            _statusText = value;
+            OnPropertyChanged();
+        }
+    }
+
+    public ICommand SelectFileCommand { get; }
+
+    private async Task OnSelectFileAsync()
+    {
+        var dialog = new OpenFileDialog
+        {
+            Title = "选择音频文件",
+            Filter = "音频文件 (*.mgg;*.mflac;*.flac;*.ogg;*.ncm;*.kgg;*.kgma;*.kwm)|*.mgg;*.mflac;*.flac;*.ogg;*.ncm;*.kgg;*.kgma;*.kwm",
+            Multiselect = false
+        };
+
+        if (dialog.ShowDialog() != true)
+        {
+            return;
+        }
+
+        IsBusy = true;
+        StatusText = "正在准备转换...";
+
+        var progress = new Progress<string>(message => StatusText = message);
+
+        try
+        {
+            ConvertResult result = await _converterService.ConvertToMp3Async(dialog.FileName, progress);
+
+            if (result.IsSuccess)
+            {
+                StatusText = string.Empty;
+                MessageBox.Show(
+                    $"转换成功。\n文件已保存到：\n{result.OutputPath}",
+                    "完成",
+                    MessageBoxButton.OK,
+                    MessageBoxImage.Information);
+            }
+            else
+            {
+                StatusText = "转换失败";
+                MessageBox.Show(
+                    $"转换失败：\n{result.ErrorMessage}",
+                    "错误",
+                    MessageBoxButton.OK,
+                    MessageBoxImage.Error);
+            }
+        }
+        finally
+        {
+            IsBusy = false;
+        }
+    }
+
+    public event PropertyChangedEventHandler? PropertyChanged;
+
+    private void OnPropertyChanged([CallerMemberName] string? name = null) =>
+        PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(name));
+}
+
+public class RelayCommand : ICommand
+{
+    private readonly Func<object?, Task> _execute;
+    private readonly Predicate<object?>? _canExecute;
+
+    public RelayCommand(Func<object?, Task> execute, Predicate<object?>? canExecute = null)
+    {
+        _execute = execute;
+        _canExecute = canExecute;
+    }
+
+    public bool CanExecute(object? parameter) => _canExecute?.Invoke(parameter) ?? true;
+
+    public async void Execute(object? parameter) => await _execute(parameter);
+
+    public event EventHandler? CanExecuteChanged;
+
+    public void RaiseCanExecuteChanged() =>
+        CanExecuteChanged?.Invoke(this, EventArgs.Empty);
+}
