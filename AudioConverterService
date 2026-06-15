@@ -59,7 +59,7 @@ public sealed class AudioConverterService : IAudioConverterService
         : this(
             new FfmpegConverter(),
             new NcmDecoder(),
-            new QqMusicInjectedMggDecryptService(),
+            new QqMusicInjectedMggDecryptService(CreateRunnerLauncher()),
             new KggDecryptService(),
             new KwmDecryptService(),
             () => Environment.GetFolderPath(Environment.SpecialFolder.Desktop),
@@ -363,6 +363,13 @@ public sealed class AudioConverterService : IAudioConverterService
         return decodedFilePath;
     }
 
+    private static IRunnerProcessLauncher CreateRunnerLauncher()
+    {
+        return UnelevatedRunnerLauncher.IsProcessElevated()
+            ? new UnelevatedRunnerLauncher()
+            : new DirectRunnerLauncher();
+    }
+
     private static string CreateTemporaryDirectory()
     {
         string path = Path.Combine(Path.GetTempPath(), "WpfApp1", "decoded", Guid.NewGuid().ToString("N"));
@@ -460,3 +467,5 @@ public sealed class AudioConverterService : IAudioConverterService
         }
     }
 }
+
+
