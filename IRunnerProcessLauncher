@@ -1,0 +1,117 @@
+using System;
+using System.Diagnostics;
+using System.IO;
+
+namespace WpfApp1.Services
+{
+    /// <summary>
+    /// 瀹氫箟鍚姩澶栭儴瑙ｅ瘑 Runner 杩涚▼鐨勬娊璞★紝渚夸簬澶勭悊鏅€氭潈闄愬拰闄嶆潈鍚姩鍦烘櫙銆?    /// </summary>
+    public interface IRunnerProcessLauncher
+    {
+        RunnerLaunchResult Launch(string runnerPath, string arguments);
+    }
+
+    /// <summary>
+    /// 淇濆瓨澶栭儴 Runner 杩涚▼鍙婂叾杈撳嚭璇诲彇鍣紝骞惰礋璐ｉ噴鏀惧拰缁堟杩涚▼璧勬簮銆?    /// </summary>
+    public sealed class RunnerLaunchResult : IDisposable
+    {
+        public bool Started { get; set; }
+
+        public Process? Process { get; set; }
+
+        public StreamReader? StandardOutput { get; set; }
+
+        public StreamReader? StandardError { get; set; }
+
+        public string? LaunchMode { get; set; }
+
+        public string? StartupError { get; set; }
+
+        private Action? _disposeResources;
+
+        public RunnerLaunchResult() { }
+
+        public RunnerLaunchResult(Action disposeResources)
+        {
+            _disposeResources = disposeResources;
+        }
+
+        public void KillProcess()
+        {
+            try
+            {
+                if (Process != null && !Process.HasExited)
+                {
+                    Process.Kill();
+                }
+            }
+            catch
+            {
+            }
+        }
+
+        public void Dispose()
+        {
+            _disposeResources?.Invoke();
+            _disposeResources = null;
+
+            try { Process?.Dispose(); }
+            catch { }
+            Process = null;
+        }
+
+        public static RunnerLaunchResult Failed(string error, string launchMode)
+        {
+            return new RunnerLaunchResult
+            {
+                Started = false,
+                StartupError = error,
+                LaunchMode = launchMode,
+            };
+        }
+    }
+
+    /// <summary>
+    /// 鐩存帴浠ュ綋鍓嶈繘绋嬫潈闄愬惎鍔ㄥ閮ㄨВ瀵?Runner銆?    /// </summary>
+    public sealed class DirectRunnerLauncher : IRunnerProcessLauncher
+    {
+        public RunnerLaunchResult Launch(string runnerPath, string arguments)
+        {
+            try
+            {
+                ProcessStartInfo psi = new ProcessStartInfo
+                {
+                    FileName = runnerPath,
+                    Arguments = arguments,
+                    UseShellExecute = false,
+                    CreateNoWindow = true,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true
+                };
+
+                Process? process = Process.Start(psi);
+                if (process == null)
+                {
+                    return RunnerLaunchResult.Failed(
+                        "Unable to start QQMusicDecryptRunner.exe.", "direct");
+                }
+
+                return new RunnerLaunchResult
+                {
+                    Started = true,
+                    Process = process,
+                    StandardOutput = process.StandardOutput,
+                    StandardError = process.StandardError,
+                    LaunchMode = "direct",
+                };
+            }
+            catch (Exception ex)
+            {
+                return RunnerLaunchResult.Failed(
+                    "Failed to start QQ Music decrypt runner: " + ex.Message, "direct");
+            }
+        }
+    }
+}
+
+
