@@ -1,338 +1,346 @@
+using System;
 using System.Diagnostics;
 using System.IO;
 using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
 
-namespace WpfApp1.Services;
-
-public interface IQqMusicMggDecryptService
+namespace WpfApp1.Services
 {
-    Task<QqMusicMggDecryptResult> DecryptAsync(
-        string inputPath,
-        string outputDirectory,
-        IProgress<string>? progress = null,
-        CancellationToken cancellationToken = default);
-}
-
-public sealed class QqMusicMggDecryptResult
-{
-    public bool IsSuccess { get; private init; }
-
-    public string? OutputPath { get; private init; }
-
-    public string? DetectedFormat { get; private init; }
-
-    public string? ErrorMessage { get; private init; }
-
-    public static QqMusicMggDecryptResult Success(string outputPath, string detectedFormat) =>
-        new() { IsSuccess = true, OutputPath = outputPath, DetectedFormat = detectedFormat };
-
-    public static QqMusicMggDecryptResult Failure(string errorMessage) =>
-        new() { IsSuccess = false, ErrorMessage = errorMessage };
-}
-
-public sealed class QqMusicInjectedMggDecryptService : IQqMusicMggDecryptService
-{
-    private const int ProcessTimeoutSeconds = 60;
-    private static readonly TimeSpan[] RetryDelays =
+    /// <summary>
+    /// 瀹氫箟 QQ 闊充箰 MGG/MFLAC 鏂囦欢瑙ｅ瘑鏈嶅姟鎺ュ彛銆?    /// </summary>
+    public interface IQqMusicMggDecryptService
     {
-        TimeSpan.FromMilliseconds(1000),
-        TimeSpan.FromMilliseconds(2500)
-    };
+        Task<QqMusicMggDecryptResult> DecryptAsync(
+            string inputPath,
+            string outputDirectory,
+            IProgress<string>? progress = null,
+            CancellationToken cancellationToken = default(CancellationToken)
+        );
+    }
 
-    public async Task<QqMusicMggDecryptResult> DecryptAsync(
-        string inputPath,
-        string outputDirectory,
-        IProgress<string>? progress = null,
-        CancellationToken cancellationToken = default)
+    /// <summary>
+    /// 琛ㄧず QQ 闊充箰鍔犲瘑闊抽瑙ｅ瘑鍚庣殑杈撳嚭璺緞銆佹牸寮忔垨澶辫触鍘熷洜銆?    /// </summary>
+    public sealed class QqMusicMggDecryptResult
     {
-        if (!File.Exists(inputPath))
+        private QqMusicMggDecryptResult() { }
+
+        public bool IsSuccess { get; private set; }
+
+        public string? OutputPath { get; private set; }
+
+        public string? DetectedFormat { get; private set; }
+
+        public string? ErrorMessage { get; private set; }
+
+        public static QqMusicMggDecryptResult Success(string outputPath, string detectedFormat)
         {
-            return QqMusicMggDecryptResult.Failure($"Input file does not exist: {inputPath}");
+            return new QqMusicMggDecryptResult
+            {
+                IsSuccess = true,
+                OutputPath = outputPath,
+                DetectedFormat = detectedFormat,
+            };
         }
 
-        string? runnerPath = FindRunnerPath();
-        if (runnerPath is null)
+        public static QqMusicMggDecryptResult Failure(string errorMessage)
         {
-            return QqMusicMggDecryptResult.Failure("QQMusicDecryptRunner.exe was not found.");
+            return new QqMusicMggDecryptResult
+            {
+                IsSuccess = false,
+                ErrorMessage = errorMessage,
+            };
+        }
+    }
+
+    /// <summary>
+    /// 閫氳繃鍚姩 Runner 骞舵敞鍏?QQ 闊充箰杩涚▼鏉ヨ皟鐢ㄥ叾鑷韩瑙ｅ瘑鑳藉姏銆?    /// </summary>
+    public sealed class QqMusicInjectedMggDecryptService : IQqMusicMggDecryptService
+    {
+        private const int ProcessTimeoutSeconds = 60;
+        private readonly IRunnerProcessLauncher _launcher;
+
+        public QqMusicInjectedMggDecryptService()
+            : this(null) { }
+
+        public QqMusicInjectedMggDecryptService(IRunnerProcessLauncher? launcher)
+        {
+            _launcher = launcher ?? new DirectRunnerLauncher();
         }
 
-        Directory.CreateDirectory(outputDirectory);
-
-        for (int attempt = 0; attempt <= RetryDelays.Length; attempt++)
+        public async Task<QqMusicMggDecryptResult> DecryptAsync(
+            string inputPath,
+            string outputDirectory,
+            IProgress<string>? progress = null,
+            CancellationToken cancellationToken = default(CancellationToken)
+        )
         {
-            progress?.Report(attempt == 0
-                ? "Connecting to QQ Music..."
-                : $"QQ Music decrypt environment is still warming up. Retrying ({attempt + 1}/{RetryDelays.Length + 1})...");
+            if (!File.Exists(inputPath))
+            {
+                return QqMusicMggDecryptResult.Failure("Input file does not exist: " + inputPath);
+            }
 
-            QqMusicMggDecryptResult attemptResult = await RunDecryptOnceAsync(
+            string? runnerPath = FindRunnerPath();
+            if (runnerPath == null)
+            {
+                return QqMusicMggDecryptResult.Failure("QQMusicDecryptRunner.exe was not found.");
+            }
+
+            Directory.CreateDirectory(outputDirectory);
+            return await DecryptOnceAsync(
                 runnerPath,
                 inputPath,
                 outputDirectory,
                 progress,
                 cancellationToken);
-
-            if (attemptResult.IsSuccess)
-            {
-                return attemptResult;
-            }
-
-            bool canRetry = attempt < RetryDelays.Length && IsTransientFailure(attemptResult.ErrorMessage);
-            if (!canRetry)
-            {
-                return NormalizeFailure(attemptResult);
-            }
-
-            await Task.Delay(RetryDelays[attempt], cancellationToken);
         }
 
-        return QqMusicMggDecryptResult.Failure("QQ Music decrypt failed.");
-    }
-
-    private static async Task<QqMusicMggDecryptResult> RunDecryptOnceAsync(
-        string runnerPath,
-        string inputPath,
-        string outputDirectory,
-        IProgress<string>? progress,
-        CancellationToken cancellationToken)
-    {
-        var psi = new ProcessStartInfo
+        private async Task<QqMusicMggDecryptResult> DecryptOnceAsync(
+            string runnerPath,
+            string inputPath,
+            string outputDirectory,
+            IProgress<string>? progress,
+            CancellationToken cancellationToken
+        )
         {
-            FileName = runnerPath,
-            Arguments = ProcessCompat.BuildArguments(inputPath, outputDirectory),
-            UseShellExecute = false,
-            CreateNoWindow = true,
-            RedirectStandardOutput = true,
-            RedirectStandardError = true
-        };
-
-        try
-        {
-            using var process = Process.Start(psi);
-            if (process is null)
-            {
-                return QqMusicMggDecryptResult.Failure("Unable to start QQMusicDecryptRunner.exe.");
-            }
-
-            QqMusicMggDecryptResult? successResult = null;
-            string? errorMessage = null;
-            var stderrBuilder = new StringBuilder();
-
-            Task stdoutTask = Task.Run(async () =>
-            {
-                while (true)
-                {
-                    string? line = await process.StandardOutput.ReadLineAsync();
-                    if (line is null)
-                    {
-                        break;
-                    }
-
-                    QqMusicMggDecryptResult? parsed = ParseLine(line, progress);
-                    if (parsed is not null)
-                    {
-                        if (parsed.IsSuccess)
-                        {
-                            successResult = parsed;
-                        }
-                        else
-                        {
-                            errorMessage ??= parsed.ErrorMessage;
-                        }
-                    }
-                }
-            }, cancellationToken);
-
-            Task stderrTask = Task.Run(async () =>
-            {
-                while (true)
-                {
-                    string? line = await process.StandardError.ReadLineAsync();
-                    if (line is null)
-                    {
-                        break;
-                    }
-
-                    if (stderrBuilder.Length > 0)
-                    {
-                        stderrBuilder.AppendLine();
-                    }
-
-                    stderrBuilder.Append(line);
-
-                    if (line.StartsWith("ERROR|", StringComparison.Ordinal))
-                    {
-                        errorMessage ??= line.Substring("ERROR|".Length);
-                    }
-                }
-            }, cancellationToken);
-
-            using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-            timeoutCts.CancelAfter(TimeSpan.FromSeconds(ProcessTimeoutSeconds));
+            string arguments = ProcessCompat.BuildArguments(inputPath, outputDirectory);
+            RunnerLaunchResult? launchResult = null;
 
             try
             {
-                await ProcessCompat.WaitForExitAsync(process, timeoutCts.Token);
-            }
-            catch (OperationCanceledException)
-            {
-                try
-                {
-                    process.Kill();
-                }
-                catch (Exception exception)
-                {
-                    Debug.WriteLine($"Failed to terminate QQMusicDecryptRunner after timeout: {exception}");
-                }
+                launchResult = _launcher.Launch(runnerPath, arguments);
 
-                return QqMusicMggDecryptResult.Failure("Timed out while waiting for QQ Music decrypt result.");
-            }
-
-            await Task.WhenAll(stdoutTask, stderrTask);
-
-            if (successResult is not null)
-            {
-                string resolvedOutputPath = ResolveOutputPath(successResult.OutputPath, outputDirectory);
-                if (!File.Exists(resolvedOutputPath))
+                if (!launchResult.Started)
                 {
                     return QqMusicMggDecryptResult.Failure(
-                        $"QQ decrypt reported success, but the output file was not found: {resolvedOutputPath}");
+                        launchResult.StartupError ?? "Unable to start QQMusicDecryptRunner.exe."
+                        + " (launch_mode=" + (launchResult.LaunchMode ?? "unknown") + ")");
                 }
 
-                string detectedFormat = string.IsNullOrWhiteSpace(successResult.DetectedFormat)
-                    ? Path.GetExtension(resolvedOutputPath).TrimStart('.')
-                    : successResult.DetectedFormat!;
+                progress?.Report("launch_mode=" + launchResult.LaunchMode);
 
-                return QqMusicMggDecryptResult.Success(resolvedOutputPath, detectedFormat);
+                QqMusicMggDecryptResult? successResult = null;
+                string? errorMessage = null;
+                StringBuilder stderrBuilder = new StringBuilder();
+
+                Task stdoutTask = Task.Run(
+                    async () =>
+                    {
+                        while (true)
+                        {
+                            string? line = await launchResult.StandardOutput!.ReadLineAsync();
+                            if (line == null)
+                            {
+                                break;
+                            }
+
+                            QqMusicMggDecryptResult? parsed = ParseLine(line, progress);
+                            if (parsed == null)
+                            {
+                                continue;
+                            }
+
+                            if (parsed.IsSuccess)
+                            {
+                                successResult = parsed;
+                            }
+                            else if (string.IsNullOrWhiteSpace(errorMessage))
+                            {
+                                errorMessage = parsed.ErrorMessage;
+                            }
+                        }
+                    },
+                    cancellationToken
+                );
+
+                Task stderrTask = Task.Run(
+                    async () =>
+                    {
+                        while (true)
+                        {
+                            string? line = await launchResult.StandardError!.ReadLineAsync();
+                            if (line == null)
+                            {
+                                break;
+                            }
+
+                            if (stderrBuilder.Length > 0)
+                            {
+                                stderrBuilder.AppendLine();
+                            }
+
+                            stderrBuilder.Append(line);
+
+                            if (line.StartsWith("ERROR|", StringComparison.Ordinal)
+                                && string.IsNullOrWhiteSpace(errorMessage))
+                            {
+                                errorMessage = line.Substring("ERROR|".Length).Trim();
+                            }
+                        }
+                    },
+                    cancellationToken
+                );
+
+                if (launchResult.Process != null)
+                {
+                    using (CancellationTokenSource timeoutCts =
+                        CancellationTokenSource.CreateLinkedTokenSource(cancellationToken))
+                    {
+                        timeoutCts.CancelAfter(TimeSpan.FromSeconds(ProcessTimeoutSeconds));
+
+                        try
+                        {
+                            await ProcessCompat.WaitForExitAsync(launchResult.Process, timeoutCts.Token);
+                        }
+                        catch (OperationCanceledException)
+                        {
+                            launchResult.KillProcess();
+
+                            return QqMusicMggDecryptResult.Failure(
+                                "Timed out waiting for QQ Music decrypt result."
+                                + " (launch_mode=" + launchResult.LaunchMode + ")"
+                            );
+                        }
+                    }
+                }
+
+                await Task.WhenAll(stdoutTask, stderrTask);
+
+                if (successResult != null)
+                {
+                    string resolvedOutputPath = ResolveOutputPath(
+                        successResult.OutputPath,
+                        outputDirectory
+                    );
+
+                    return QqMusicMggDecryptResult.Success(
+                        resolvedOutputPath,
+                        successResult.DetectedFormat
+                    );
+                }
+
+                if (!string.IsNullOrWhiteSpace(errorMessage))
+                {
+                    return QqMusicMggDecryptResult.Failure(errorMessage!);
+                }
+
+                if (stderrBuilder.Length > 0)
+                {
+                    return QqMusicMggDecryptResult.Failure(stderrBuilder.ToString().Trim());
+                }
+
+                int exitCode = -1;
+                try
+                {
+                    if (launchResult.Process != null)
+                    {
+                        exitCode = launchResult.Process.ExitCode;
+                    }
+                }
+                catch
+                {
+                }
+
+                return QqMusicMggDecryptResult.Failure(
+                    "QQMusicDecryptRunner.exe failed. Exit code: " + exitCode
+                    + " (launch_mode=" + launchResult.LaunchMode + ")"
+                );
             }
-
-            if (!string.IsNullOrWhiteSpace(errorMessage))
+            catch (Exception ex)
             {
-                return QqMusicMggDecryptResult.Failure(errorMessage!);
+                return QqMusicMggDecryptResult.Failure(
+                    "Failed to start QQ Music decrypt runner: " + ex.Message
+                );
             }
-
-            if (stderrBuilder.Length > 0)
+            finally
             {
-                return QqMusicMggDecryptResult.Failure(stderrBuilder.ToString().Trim());
+                launchResult?.Dispose();
+            }
+        }
+
+        private static QqMusicMggDecryptResult ParseLine(string line, IProgress<string> progress)
+        {
+            if (line.StartsWith("LOG|", StringComparison.Ordinal))
+            {
+                progress?.Report(line.Substring("LOG|".Length));
+                return null;
             }
 
-            return QqMusicMggDecryptResult.Failure(
-                $"QQMusicDecryptRunner.exe failed with exit code {process.ExitCode}.");
-        }
-        catch (Exception ex)
-        {
-            return QqMusicMggDecryptResult.Failure($"Failed to start QQ Music decrypt host: {ex.Message}");
-        }
-    }
+            if (line.StartsWith("ERROR|", StringComparison.Ordinal))
+            {
+                return QqMusicMggDecryptResult.Failure(line.Substring("ERROR|".Length).Trim());
+            }
 
-    private static bool IsTransientFailure(string? errorMessage)
-    {
-        if (string.IsNullOrWhiteSpace(errorMessage))
-        {
-            return false;
-        }
+            if (line.StartsWith("RESULT|", StringComparison.Ordinal))
+            {
+                string[] parts = line.Split('|');
+                if (parts.Length >= 3)
+                {
+                    return QqMusicMggDecryptResult.Success(parts[1].Trim(), parts[2].Trim());
+                }
 
-        string value = errorMessage!;
-        return value.IndexOf("STATUS_INTERNAL_ERROR", StringComparison.OrdinalIgnoreCase) >= 0 ||
-               value.IndexOf("Timed out", StringComparison.OrdinalIgnoreCase) >= 0 ||
-               value.IndexOf("QQMusicCommon", StringComparison.OrdinalIgnoreCase) >= 0 ||
-               value.IndexOf("invalid decrypted audio data", StringComparison.OrdinalIgnoreCase) >= 0 ||
-               value.IndexOf("not ready", StringComparison.OrdinalIgnoreCase) >= 0;
-    }
+                return QqMusicMggDecryptResult.Failure("QQ Music returned an invalid decrypt result.");
+            }
 
-    private static QqMusicMggDecryptResult NormalizeFailure(QqMusicMggDecryptResult result)
-    {
-        string detail = string.IsNullOrWhiteSpace(result.ErrorMessage)
-            ? "Unknown error."
-            : result.ErrorMessage!;
-
-        if (IsTransientFailure(detail))
-        {
-            return QqMusicMggDecryptResult.Failure(
-                $"QQ Music decrypt environment is not ready yet. Please retry in a moment. Details: {detail}");
-        }
-
-        return QqMusicMggDecryptResult.Failure(detail);
-    }
-
-    private static QqMusicMggDecryptResult? ParseLine(string line, IProgress<string>? progress)
-    {
-        if (line.StartsWith("LOG|", StringComparison.Ordinal))
-        {
-            progress?.Report(line.Substring("LOG|".Length));
             return null;
         }
 
-        if (line.StartsWith("ERROR|", StringComparison.Ordinal))
+        private static string ResolveOutputPath(string? outputPath, string outputDirectory)
         {
-            return QqMusicMggDecryptResult.Failure(line.Substring("ERROR|".Length));
-        }
-
-        if (line.StartsWith("RESULT|", StringComparison.Ordinal))
-        {
-            string[] parts = line.Split('|');
-            if (parts.Length >= 3)
+            if (!string.IsNullOrWhiteSpace(outputPath))
             {
-                return QqMusicMggDecryptResult.Success(parts[1].Trim(), parts[2].Trim());
-            }
-
-            return QqMusicMggDecryptResult.Failure("QQ Music decrypt returned an invalid result.");
-        }
-
-        return null;
-    }
-
-    private static string ResolveOutputPath(string? outputPath, string outputDirectory)
-    {
-        if (!string.IsNullOrWhiteSpace(outputPath))
-        {
-            string trimmedPath = outputPath!.Trim();
-            if (File.Exists(trimmedPath))
-            {
-                return trimmedPath;
-            }
-
-            string baseName = Path.GetFileNameWithoutExtension(trimmedPath);
-            if (!string.IsNullOrWhiteSpace(baseName) && Directory.Exists(outputDirectory))
-            {
-                string[] candidates = Directory.GetFiles(outputDirectory, baseName + ".*");
-                if (candidates.Length > 0)
+                string trimmedPath = outputPath.Trim();
+                if (File.Exists(trimmedPath))
                 {
-                    return candidates[0];
+                    return trimmedPath;
+                }
+
+                string baseName = Path.GetFileNameWithoutExtension(trimmedPath);
+                if (!string.IsNullOrWhiteSpace(baseName) && Directory.Exists(outputDirectory))
+                {
+                    string[] candidates = Directory.GetFiles(outputDirectory, baseName + ".*");
+                    if (candidates.Length > 0)
+                    {
+                        return candidates[0];
+                    }
                 }
             }
-        }
 
-        if (Directory.Exists(outputDirectory))
-        {
-            string[] files = Directory.GetFiles(outputDirectory);
-            if (files.Length == 1)
+            if (Directory.Exists(outputDirectory))
             {
-                return files[0];
+                string[] files = Directory.GetFiles(outputDirectory);
+                if (files.Length == 1)
+                {
+                    return files[0];
+                }
             }
+
+            return outputPath != null ? outputPath.Trim() : outputDirectory;
         }
 
-        return outputPath?.Trim() ?? outputDirectory;
-    }
-
-    private static string? FindRunnerPath()
-    {
-        string baseDirectory = AppDomain.CurrentDomain.BaseDirectory;
-        string[] candidates =
+        private static string? FindRunnerPath()
         {
-            Path.Combine(baseDirectory, "QQMusicDecryptRunner.exe"),
-            Path.Combine(baseDirectory, "Tools", "QQMusicDecryptRunner.exe"),
-            Path.GetFullPath(Path.Combine(baseDirectory, "..", "..", "..", "..", "QQMusicDecryptRunner", "bin", "Debug", "net472", "QQMusicDecryptRunner.exe")),
-            Path.GetFullPath(Path.Combine(baseDirectory, "..", "..", "..", "..", "QQMusicDecryptRunner", "bin", "Release", "net472", "QQMusicDecryptRunner.exe"))
-        };
-
-        foreach (string candidate in candidates)
-        {
-            if (File.Exists(candidate))
+            string baseDirectory = AppDomain.CurrentDomain.BaseDirectory;
+            string[] candidates =
             {
-                return candidate;
-            }
-        }
+                Path.Combine(baseDirectory, "QQMusicDecryptRunner.exe"),
+                Path.Combine(baseDirectory, "Tools", "QQMusicDecryptRunner.exe"),
+                Path.Combine(baseDirectory, "MP3AudioConverter.QQMusicDecryptRunner.exe"),
+                Path.GetFullPath(Path.Combine(baseDirectory, "..", "..", "..", "..", "QQMusicDecryptRunner", "bin", "Debug", "net472", "QQMusicDecryptRunner.exe")),
+                Path.GetFullPath(Path.Combine(baseDirectory, "..", "..", "..", "..", "QQMusicDecryptRunner", "bin", "Release", "net472", "QQMusicDecryptRunner.exe"))
+            };
 
-        return null;
+            foreach (string candidate in candidates)
+            {
+                if (File.Exists(candidate))
+                {
+                    return candidate;
+                }
+            }
+
+            return null;
+        }
     }
 }
+
+
